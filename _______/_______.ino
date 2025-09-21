@@ -1,142 +1,224 @@
-# include <PS4BT.h>
-# include <usbhub.h>
+/*
+ * PS4 Left/Right Stick (0..255, neutral band) -> Dual DC Motors via L298N
+ * Board : Arduino UNO R3 + USB Host Shield 2.0 + BT dongle
+ * A-CH  : D3=ENA(PWM), D4=IN1, D6=IN2  -> OUT1/OUT2 (Left stick Y)
+ * B-CH  : D5=ENB(PWM), D7=IN3, D8=IN4  -> OUT3/OUT4 (Right stick Y)
+ *
+ * Controls:
+ *   Left  Stick Y : Motor A（OUT1/2）  0..NEUTRAL_LO 逆転 / NEUTRAL帯 停止 / NEUTRAL_HI..255 正転
+ *   Right Stick Y : Motor B（OUT3/4）  同上
+ *   L1 (hold)     : 両モータ ブレーキ
+ *   PS (click)    : 非常停止（両モータ停止）
+ */
 
-// Satisfy the IDE, which needs to see the include statment in the ino too.
-# ifdef dobogusinclude
-# include <spi4teensy3.h>
-# endif
-# include <SPI.h>
+#include <SPI.h>
+#include <usbhub.h>
+#include <PS4BT.h>
 
-USB Usb;
-//USBHub Hub1(&Usb); // Some dongles have a hub inside
-BTD Btd(&Usb); // You have to create the Bluetooth Dongle instance like so
-
-/* You can create the instance of the PS4BT class in two ways */
-// This will start an inquiry and then pair with the PS4 controller - you only have to do this once
-// You will need to hold down the PS and Share button at the same time, the PS4 controller will then start to blink rapidly indicating that it is in pairing mode
+// --- 通信は最初に学習した形を維持 ---
+USB   Usb;
+BTD   Btd(&Usb);
 PS4BT PS4(&Btd, PAIR);
 
-// After that you can simply create the instance like so and then press the PS button on the device
-//PS4BT PS4(&Btd);
+// ===== ドライバ：L298N =====
+#define DRIVER_L298N 1
 
-bool printAngle, printTouch;
-uint8_t oldL2Value, oldR2Value;
+// ===== ピン割り当て（A=Left, B=Right）=====
+const uint8_t PIN_PWM_A = 3;  // ENA  (PWM) ← D3
+const uint8_t PIN_IN1_A = 4;  // IN1        ← D4
+const uint8_t PIN_IN2_A = 6;  // IN2        ← D6
+
+const uint8_t PIN_PWM_B = 5;  // ENB  (PWM) ← D5
+const uint8_t PIN_IN3_B = 7;  // IN3        ← D7
+const uint8_t PIN_IN4_B = 8;  // IN4        ← D8
+
+// --- 中立バンド（この範囲は停止：必要に応じて調整）---
+const uint8_t NEUTRAL_LO = 120;
+const uint8_t NEUTRAL_HI = 135;
+
+// デバッグ表示
+const bool DEBUG_ECHO = false;
+
+// ランプ（加減速をなめらかに）
+const uint8_t  MAX_PWM_STEP  = 7;
+const uint16_t UPDATE_PERIOD = 12;   // ms
+const uint16_t FAILSAFE_MS   = 600;  // ms
+
+// ランタイム（A/B 独立）
+int16_t  targetPWM_A = 0, currentPWM_A = 0;
+int16_t  targetPWM_B = 0, currentPWM_B = 0;
+uint32_t lastUpdateMs_A = 0, lastUpdateMs_B = 0;
+uint32_t lastRxMs = 0;
+
+// ---- モータ制御（L298N）A側 ----
+static inline void motorCoastA() {
+  digitalWrite(PIN_IN1_A, LOW);
+  digitalWrite(PIN_IN2_A, LOW);
+  analogWrite(PIN_PWM_A, 0);
+}
+static inline void motorBrakeA() {
+  digitalWrite(PIN_IN1_A, HIGH);
+  digitalWrite(PIN_IN2_A, HIGH);
+  analogWrite(PIN_PWM_A, 0);
+}
+static inline void motorDriveSignedA(int16_t pwmSigned) {
+  int16_t mag = (pwmSigned >= 0) ? pwmSigned : -pwmSigned;
+  if (mag == 0) { motorCoastA(); return; }
+  if (pwmSigned > 0) { digitalWrite(PIN_IN1_A, HIGH); digitalWrite(PIN_IN2_A, LOW); }
+  else               { digitalWrite(PIN_IN1_A, LOW);  digitalWrite(PIN_IN2_A, HIGH); }
+  if (mag > 255) mag = 255;
+  analogWrite(PIN_PWM_A, mag);
+}
+
+// ---- モータ制御（L298N）B側 ----
+static inline void motorCoastB() {
+  digitalWrite(PIN_IN3_B, LOW);
+  digitalWrite(PIN_IN4_B, LOW);
+  analogWrite(PIN_PWM_B, 0);
+}
+static inline void motorBrakeB() {
+  digitalWrite(PIN_IN3_B, HIGH);
+  digitalWrite(PIN_IN4_B, HIGH);
+  analogWrite(PIN_PWM_B, 0);
+}
+static inline void motorDriveSignedB(int16_t pwmSigned) {
+  int16_t mag = (pwmSigned >= 0) ? pwmSigned : -pwmSigned;
+  if (mag == 0) { motorCoastB(); return; }
+  if (pwmSigned > 0) { digitalWrite(PIN_IN3_B, HIGH); digitalWrite(PIN_IN4_B, LOW); }
+  else               { digitalWrite(PIN_IN3_B, LOW);  digitalWrite(PIN_IN4_B, HIGH); }
+  if (mag > 255) mag = 255;
+  analogWrite(PIN_PWM_B, mag);
+}
+
+// ---- 0..255（NEUTRAL_LO..NEUTRAL_HI=停止）→ -255..+255 ----
+static inline int16_t stickToSignedPWM_neutralBand(uint8_t v) {
+  if (v <= NEUTRAL_LO) {
+    int16_t mag = (int32_t)(NEUTRAL_LO - v) * 255 / NEUTRAL_LO;     // 0→最大逆転
+    return -mag;
+  } else if (v >= NEUTRAL_HI) {
+    int16_t mag = (int32_t)(v - NEUTRAL_HI) * 255 / (255 - NEUTRAL_HI); // 255→最大正転
+    return mag;
+  } else {
+    return 0; // 中立帯
+  }
+}
+
+// ---- ランプ処理（A/B）----
+static inline void applyRampA() {
+  uint32_t now = millis();
+  if ((uint32_t)(now - lastUpdateMs_A) < UPDATE_PERIOD) return;
+  lastUpdateMs_A = now;
+  if (currentPWM_A < targetPWM_A) {
+    int16_t next = currentPWM_A + (int16_t)MAX_PWM_STEP;
+    if (next > targetPWM_A) next = targetPWM_A;
+    currentPWM_A = next;
+  } else if (currentPWM_A > targetPWM_A) {
+    int16_t next = currentPWM_A - (int16_t)MAX_PWM_STEP;
+    if (next < targetPWM_A) next = targetPWM_A;
+    currentPWM_A = next;
+  }
+}
+static inline void applyRampB() {
+  uint32_t now = millis();
+  if ((uint32_t)(now - lastUpdateMs_B) < UPDATE_PERIOD) return;
+  lastUpdateMs_B = now;
+  if (currentPWM_B < targetPWM_B) {
+    int16_t next = currentPWM_B + (int16_t)MAX_PWM_STEP;
+    if (next > targetPWM_B) next = targetPWM_B;
+    currentPWM_B = next;
+  } else if (currentPWM_B > targetPWM_B) {
+    int16_t next = currentPWM_B - (int16_t)MAX_PWM_STEP;
+    if (next < targetPWM_B) next = targetPWM_B;
+    currentPWM_B = next;
+  }
+}
+
+// ---- フェイルセーフ（両モータ停止）----
+static inline void failSafe(bool connected) {
+  if (!connected) {
+    targetPWM_A = currentPWM_A = 0;
+    targetPWM_B = currentPWM_B = 0;
+    motorCoastA();
+    motorCoastB();
+    return;
+  }
+  if ((uint32_t)(millis() - lastRxMs) > FAILSAFE_MS) {
+    targetPWM_A = 0;
+    targetPWM_B = 0;
+    motorCoastA();
+    motorCoastB();
+  }
+}
 
 void setup() {
   Serial.begin(115200);
-# if !defined(__MIPSEL__)
-  while (!Serial); // Wait for serial port to connect - used on Leonardo, Teensy and other boards with built-in USB CDC serial connection
-# endif
+  while (!Serial) { ; }
+
   if (Usb.Init() == -1) {
-    Serial.print(F("\r\nOSC did not start"));
-    while (1); // Halt
+    Serial.println(F("USB Host Shield init failed."));
+    while (1) { delay(1000); }
   }
-  Serial.print(F("\r\nPS4 Bluetooth Library Started"));
+  Serial.println(F("USB Host OK. Keep your PS4 pairing flow."));
+
+  pinMode(PIN_PWM_A, OUTPUT);
+  pinMode(PIN_IN1_A, OUTPUT);
+  pinMode(PIN_IN2_A, OUTPUT);
+
+  pinMode(PIN_PWM_B, OUTPUT);
+  pinMode(PIN_IN3_B, OUTPUT);
+  pinMode(PIN_IN4_B, OUTPUT);
+
+  motorCoastA();
+  motorCoastB();
+
+  lastUpdateMs_A = lastUpdateMs_B = lastRxMs = millis();
 }
+
 void loop() {
-  Usb.Task();
-//delay(1);
-//Serial.println(PS4.connected());
+  Usb.Task();                         // 通信維持
+  const bool connected = PS4.connected();
+  failSafe(connected);
+  if (!connected) return;
 
-  if (PS4.connected()) {
-    if (PS4.getAnalogHat(LeftHatX) > 137 || PS4.getAnalogHat(LeftHatX) < 117 || PS4.getAnalogHat(LeftHatY) > 137 || PS4.getAnalogHat(LeftHatY) < 117 || PS4.getAnalogHat(RightHatX) > 137 || PS4.getAnalogHat(RightHatX) < 117 || PS4.getAnalogHat(RightHatY) > 137 || PS4.getAnalogHat(RightHatY) < 117) {
-      Serial.print(F("\r\nLeftHatX: "));
-      Serial.print(PS4.getAnalogHat(LeftHatX));
-      Serial.print(F("\tLeftHatY: "));
-      Serial.print(PS4.getAnalogHat(LeftHatY));
-      Serial.print(F("\tRightHatX: "));
-      Serial.print(PS4.getAnalogHat(RightHatX));
-      Serial.print(F("\tRightHatY: "));
-      Serial.print(PS4.getAnalogHat(RightHatY));
-    }
-
-    if (PS4.getAnalogButton(L2) || PS4.getAnalogButton(R2)) { // These are the only analog buttons on the PS4 controller
-      Serial.print(F("\r\nL2: "));
-      Serial.print(PS4.getAnalogButton(L2));
-      Serial.print(F("\tR2: "));
-      Serial.print(PS4.getAnalogButton(R2));
-    }
-    if (PS4.getAnalogButton(L2) != oldL2Value || PS4.getAnalogButton(R2) != oldR2Value) // Only write value if it's different
-      PS4.setRumbleOn(PS4.getAnalogButton(L2), PS4.getAnalogButton(R2));
-    oldL2Value = PS4.getAnalogButton(L2);
-    oldR2Value = PS4.getAnalogButton(R2);
-
-    if (PS4.getButtonClick(PS)) {
-      Serial.print(F("\r\nPS"));
-      PS4.disconnect();
-    }
-    else {
-      if (PS4.getButtonClick(TRIANGLE)) {
-        Serial.print(F("\r\nTriangle"));
-        PS4.setRumbleOn(RumbleLow);
-      }
-      if (PS4.getButtonClick(CIRCLE)) {
-        Serial.print(F("\r\nCircle"));
-        PS4.setRumbleOn(RumbleHigh);
-      }
-      if (PS4.getButtonClick(CROSS)) {
-        Serial.print(F("\r\nCross"));
-        PS4.setLedFlash(10, 10); // Set it to blink rapidly
-      }
-      if (PS4.getButtonClick(SQUARE)) {
-        Serial.print(F("\r\nSquare"));
-        PS4.setLedFlash(0, 0); // Turn off blinking
-      }
-
-      if (PS4.getButtonClick(UP)) {
-        Serial.print(F("\r\nUp"));
-        PS4.setLed(Red);
-      } if (PS4.getButtonClick(RIGHT)) {
-        Serial.print(F("\r\nRight"));
-        PS4.setLed(Blue);
-      } if (PS4.getButtonClick(DOWN)) {
-        Serial.print(F("\r\nDown"));
-        PS4.setLed(Yellow);
-      } if (PS4.getButtonClick(LEFT)) {
-        Serial.print(F("\r\nLeft"));
-        PS4.setLed(Green);
-      }
-
-      if (PS4.getButtonClick(L1))
-        Serial.print(F("\r\nL1"));
-      if (PS4.getButtonClick(L3))
-        Serial.print(F("\r\nL3"));
-      if (PS4.getButtonClick(R1))
-        Serial.print(F("\r\nR1"));
-      if (PS4.getButtonClick(R3))
-        Serial.print(F("\r\nR3"));
-
-      if (PS4.getButtonClick(SHARE))
-        Serial.print(F("\r\nShare"));
-      if (PS4.getButtonClick(OPTIONS)) {
-        Serial.print(F("\r\nOptions"));
-        printAngle = !printAngle;
-      }
-      if (PS4.getButtonClick(TOUCHPAD)) {
-        Serial.print(F("\r\nTouchpad"));
-        printTouch = !printTouch;
-      }
-
-      if (printAngle) { // Print angle calculated using the accelerometer only
-        Serial.print(F("\r\nPitch: "));
-        Serial.print(PS4.getAngle(Pitch));
-        Serial.print(F("\tRoll: "));
-        Serial.print(PS4.getAngle(Roll));
-      }
-
-      if (printTouch) { // Print the x, y coordinates of the touchpad
-        if (PS4.isTouching(0) || PS4.isTouching(1)) // Print newline and carriage return if any of the fingers are touching the touchpad
-          Serial.print(F("\r\n"));
-        for (uint8_t i = 0; i < 2; i++) { // The touchpad track two fingers
-          if (PS4.isTouching(i)) { // Print the position of the finger if it is touching the touchpad
-            Serial.print(F("X")); Serial.print(i + 1); Serial.print(F(": "));
-            Serial.print(PS4.getX(i));
-            Serial.print(F("\tY")); Serial.print(i + 1); Serial.print(F(": "));
-            Serial.print(PS4.getY(i));
-            Serial.print(F("\t"));
-          }
-        }
-      }
-    }
+  // 非常停止（PS）
+  if (PS4.getButtonClick(PS)) {
+    targetPWM_A = currentPWM_A = 0;
+    targetPWM_B = currentPWM_B = 0;
+    motorCoastA();
+    motorCoastB();
+    return;
   }
+
+  // ブレーキ（L1）: 両モータ
+  const bool braking = PS4.getButtonPress(L1);
+
+  // 左スティックY → Motor A
+  const uint8_t rawY_A = PS4.getAnalogHat(LeftHatY);
+  const int16_t cmdA   = stickToSignedPWM_neutralBand(rawY_A);
+  if (cmdA != targetPWM_A) { targetPWM_A = cmdA; lastRxMs = millis(); }
+
+  // 右スティックY → Motor B
+  const uint8_t rawY_B = PS4.getAnalogHat(RightHatY);
+  const int16_t cmdB   = stickToSignedPWM_neutralBand(rawY_B);
+  if (cmdB != targetPWM_B) { targetPWM_B = cmdB; lastRxMs = millis(); }
+
+  if (DEBUG_ECHO) {
+    Serial.print(F("LY=")); Serial.print(rawY_A);
+    Serial.print(F(" pwmA=")); Serial.print(targetPWM_A);
+    Serial.print(F(" | RY=")); Serial.print(rawY_B);
+    Serial.print(F(" pwmB=")); Serial.println(targetPWM_B);
+  }
+
+  // 出力
+  applyRampA();
+  applyRampB();
+  if (braking) {
+    motorBrakeA();
+    motorBrakeB();
+  } else {
+    motorDriveSignedA(currentPWM_A);
+    motorDriveSignedB(currentPWM_B);
+  }
+
+  delay(1);
 }
