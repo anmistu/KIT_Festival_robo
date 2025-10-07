@@ -1,224 +1,254 @@
-/*
- * PS4 Left/Right Stick (0..255, neutral band) -> Dual DC Motors via L298N
- * Board : Arduino UNO R3 + USB Host Shield 2.0 + BT dongle
- * A-CH  : D3=ENA(PWM), D4=IN1, D6=IN2  -> OUT1/OUT2 (Left stick Y)
- * B-CH  : D5=ENB(PWM), D7=IN3, D8=IN4  -> OUT3/OUT4 (Right stick Y)
- *
- * Controls:
- *   Left  Stick Y : Motor A（OUT1/2）  0..NEUTRAL_LO 逆転 / NEUTRAL帯 停止 / NEUTRAL_HI..255 正転
- *   Right Stick Y : Motor B（OUT3/4）  同上
- *   L1 (hold)     : 両モータ ブレーキ
- *   PS (click)    : 非常停止（両モータ停止）
+/*  _______-servo.ino  (UNO/USB Host Shield/PS4/L298N/Servo)
+ *  修正点:
+ *   - Motor 構造体に 3引数コンストラクタを追加（pwmPin, in1Pin, in2Pin）
+ *   - 十字キーUP/DOWNをクリック毎に±60°の段階回転
+ *   - 既存: スティック中立帯, スロープ, フェイルセーフ, L1ブレーキ, PS非常停止
  */
 
 #include <SPI.h>
 #include <usbhub.h>
 #include <PS4BT.h>
+#include <Servo.h>
 
-// --- 通信は最初に学習した形を維持 ---
-USB   Usb;
-BTD   Btd(&Usb);
-PS4BT PS4(&Btd, PAIR);
+// ============== USB Host / PS4 ==============
+USB     Usb;
+BTD     Btd(&Usb);
+PS4BT   PS4(&Btd);
 
-// ===== ドライバ：L298N =====
-#define DRIVER_L298N 1
+// ============== Servo =======================
+const uint8_t SERVO_PIN      = 2;
+const int     SERVO_MIN_DEG  = 0;
+const int     SERVO_MAX_DEG  = 180;
+const int     SERVO_STEP_DEG = 60;   // 1クリックで動かす角度
+const int     SERVO_INIT_DEG = 90;   // 非常停止時に戻す角度
 
-// ===== ピン割り当て（A=Left, B=Right）=====
-const uint8_t PIN_PWM_A = 3;  // ENA  (PWM) ← D3
-const uint8_t PIN_IN1_A = 4;  // IN1        ← D4
-const uint8_t PIN_IN2_A = 6;  // IN2        ← D6
+Servo g_servo;
+int   g_servoAngle = SERVO_INIT_DEG;
 
-const uint8_t PIN_PWM_B = 5;  // ENB  (PWM) ← D5
-const uint8_t PIN_IN3_B = 7;  // IN3        ← D7
-const uint8_t PIN_IN4_B = 8;  // IN4        ← D8
 
-// --- 中立バンド（この範囲は停止：必要に応じて調整）---
-const uint8_t NEUTRAL_LO = 120;
-const uint8_t NEUTRAL_HI = 135;
+// ===== Servo #2 (LEFT/RIGHT クリックで±60°) =====
+const uint8_t SERVO2_PIN      = 0;   // ←未使用のピンに変更可
+const int     SERVO2_MIN_DEG  = 0;
+const int     SERVO2_MAX_DEG  = 180;
+const int     SERVO2_STEP_DEG = 60;  // 1クリックで動かす角度
+const int     SERVO2_INIT_DEG = 90;  // 非常停止時などの基準角
 
-// デバッグ表示
-const bool DEBUG_ECHO = false;
+Servo g_servo2;
+int   g_servo2Angle = SERVO2_INIT_DEG;
 
-// ランプ（加減速をなめらかに）
-const uint8_t  MAX_PWM_STEP  = 7;
-const uint16_t UPDATE_PERIOD = 12;   // ms
-const uint16_t FAILSAFE_MS   = 600;  // ms
 
-// ランタイム（A/B 独立）
-int16_t  targetPWM_A = 0, currentPWM_A = 0;
-int16_t  targetPWM_B = 0, currentPWM_B = 0;
-uint32_t lastUpdateMs_A = 0, lastUpdateMs_B = 0;
-uint32_t lastRxMs = 0;
+// ============== Motor (L298N) ===============
+struct Motor {
+  uint8_t pwmPin;  // ENA/ENB (PWM)
+  uint8_t in1Pin;
+  uint8_t in2Pin;
 
-// ---- モータ制御（L298N）A側 ----
-static inline void motorCoastA() {
-  digitalWrite(PIN_IN1_A, LOW);
-  digitalWrite(PIN_IN2_A, LOW);
-  analogWrite(PIN_PWM_A, 0);
-}
-static inline void motorBrakeA() {
-  digitalWrite(PIN_IN1_A, HIGH);
-  digitalWrite(PIN_IN2_A, HIGH);
-  analogWrite(PIN_PWM_A, 0);
-}
-static inline void motorDriveSignedA(int16_t pwmSigned) {
-  int16_t mag = (pwmSigned >= 0) ? pwmSigned : -pwmSigned;
-  if (mag == 0) { motorCoastA(); return; }
-  if (pwmSigned > 0) { digitalWrite(PIN_IN1_A, HIGH); digitalWrite(PIN_IN2_A, LOW); }
-  else               { digitalWrite(PIN_IN1_A, LOW);  digitalWrite(PIN_IN2_A, HIGH); }
-  if (mag > 255) mag = 255;
-  analogWrite(PIN_PWM_A, mag);
-}
+  int currentPWM;  // -255..+255
+  int targetPWM;
 
-// ---- モータ制御（L298N）B側 ----
-static inline void motorCoastB() {
-  digitalWrite(PIN_IN3_B, LOW);
-  digitalWrite(PIN_IN4_B, LOW);
-  analogWrite(PIN_PWM_B, 0);
-}
-static inline void motorBrakeB() {
-  digitalWrite(PIN_IN3_B, HIGH);
-  digitalWrite(PIN_IN4_B, HIGH);
-  analogWrite(PIN_PWM_B, 0);
-}
-static inline void motorDriveSignedB(int16_t pwmSigned) {
-  int16_t mag = (pwmSigned >= 0) ? pwmSigned : -pwmSigned;
-  if (mag == 0) { motorCoastB(); return; }
-  if (pwmSigned > 0) { digitalWrite(PIN_IN3_B, HIGH); digitalWrite(PIN_IN4_B, LOW); }
-  else               { digitalWrite(PIN_IN3_B, LOW);  digitalWrite(PIN_IN4_B, HIGH); }
-  if (mag > 255) mag = 255;
-  analogWrite(PIN_PWM_B, mag);
-}
+  // ★ 追加: 明示的コンストラクタ（UNOでの初期化エラー対策）
+  Motor() : pwmPin(255), in1Pin(255), in2Pin(255), currentPWM(0), targetPWM(0) {}
+  Motor(uint8_t pwm, uint8_t in1, uint8_t in2)
+  : pwmPin(pwm), in1Pin(in1), in2Pin(in2), currentPWM(0), targetPWM(0) {}
 
-// ---- 0..255（NEUTRAL_LO..NEUTRAL_HI=停止）→ -255..+255 ----
-static inline int16_t stickToSignedPWM_neutralBand(uint8_t v) {
-  if (v <= NEUTRAL_LO) {
-    int16_t mag = (int32_t)(NEUTRAL_LO - v) * 255 / NEUTRAL_LO;     // 0→最大逆転
-    return -mag;
-  } else if (v >= NEUTRAL_HI) {
-    int16_t mag = (int32_t)(v - NEUTRAL_HI) * 255 / (255 - NEUTRAL_HI); // 255→最大正転
-    return mag;
-  } else {
-    return 0; // 中立帯
+  void begin() {
+    pinMode(in1Pin, OUTPUT);
+    pinMode(in2Pin, OUTPUT);
+    pinMode(pwmPin, OUTPUT);
+    coast();
+  }
+
+  void setTargetPWM(int v) {
+    if (v > 255) v = 255;
+    if (v < -255) v = -255;
+    targetPWM = v;
+  }
+
+  void coast() { // 自由回転
+    digitalWrite(in1Pin, LOW);
+    digitalWrite(in2Pin, LOW);
+    analogWrite(pwmPin, 0);
+    currentPWM = 0;
+    targetPWM  = 0;
+  }
+
+  void brake() { // 電気ブレーキ
+    digitalWrite(in1Pin, HIGH);
+    digitalWrite(in2Pin, HIGH);
+    analogWrite(pwmPin, 0);
+    currentPWM = 0;
+    targetPWM  = 0;
+  }
+
+  void apply(int pwm) {
+    if (pwm == 0) {
+      digitalWrite(in1Pin, LOW);
+      digitalWrite(in2Pin, LOW);
+      analogWrite(pwmPin, 0);
+      return;
+    }
+    if (pwm > 0) {
+      digitalWrite(in1Pin, HIGH);
+      digitalWrite(in2Pin, LOW);
+      analogWrite(pwmPin, pwm);
+    } else {
+      digitalWrite(in1Pin, LOW);
+      digitalWrite(in2Pin, HIGH);
+      analogWrite(pwmPin, -pwm);
+    }
+  }
+
+  void updateRamp(int step) {
+    if (currentPWM < targetPWM) {
+      currentPWM += step;
+      if (currentPWM > targetPWM) currentPWM = targetPWM;
+    } else if (currentPWM > targetPWM) {
+      currentPWM -= step;
+      if (currentPWM < targetPWM) currentPWM = targetPWM;
+    }
+    apply(currentPWM);
+  }
+};
+
+// ピン割り当て（L298N）: 左モータA / 右モータB
+Motor motorA(3, 4, 6);  // ENA=3(PWM), IN1=4, IN2=6
+Motor motorB(5, 7, 8);  // ENB=5(PWM), IN3=7, IN4=8
+
+// ============== Control params ==============
+const uint8_t  NEUTRAL_LO     = 120; // スティック中立帯 下限
+const uint8_t  NEUTRAL_HI     = 135; // スティック中立帯 上限
+const uint8_t  RAMP_STEP      = 7;   // スロープ1ステップのPWM変化量
+const uint16_t UPDATE_PERIOD  = 12;  // スロープ更新周期[ms]
+const uint16_t FAILSAFE_MS    = 600; // 入力喪失でCoastへ[ms]
+
+uint32_t lastUpdateMs = 0;
+uint32_t lastRxMs     = 0;
+
+// ============== Helpers =====================
+int mapStickToPWM(uint8_t v) {
+  // 0..255, 中立はおおよそ 127
+  if (v >= NEUTRAL_LO && v <= NEUTRAL_HI) return 0;
+
+  if (v > NEUTRAL_HI) {
+    float t = (float)(v - NEUTRAL_HI) / (255.0f - (float)NEUTRAL_HI);
+    int pwm = (int)(t * 255.0f + 0.5f);
+    if (pwm > 255) pwm = 255;
+    return pwm;
+  } else { // v < NEUTRAL_LO
+    float t = (float)(NEUTRAL_LO - v) / (float)NEUTRAL_LO;
+    int pwm = (int)(t * 255.0f + 0.5f);
+    if (pwm > 255) pwm = 255;
+    return -pwm;
   }
 }
 
-// ---- ランプ処理（A/B）----
-static inline void applyRampA() {
-  uint32_t now = millis();
-  if ((uint32_t)(now - lastUpdateMs_A) < UPDATE_PERIOD) return;
-  lastUpdateMs_A = now;
-  if (currentPWM_A < targetPWM_A) {
-    int16_t next = currentPWM_A + (int16_t)MAX_PWM_STEP;
-    if (next > targetPWM_A) next = targetPWM_A;
-    currentPWM_A = next;
-  } else if (currentPWM_A > targetPWM_A) {
-    int16_t next = currentPWM_A - (int16_t)MAX_PWM_STEP;
-    if (next < targetPWM_A) next = targetPWM_A;
-    currentPWM_A = next;
-  }
+void emergencyStopAll() {
+  motorA.coast();
+  motorB.coast();
+  
+  g_servoAngle = SERVO_INIT_DEG;
+  g_servo.write(g_servoAngle);
+  
+  g_servo2Angle = SERVO2_INIT_DEG;
+  g_servo2.write(g_servo2Angle);
 }
-static inline void applyRampB() {
-  uint32_t now = millis();
-  if ((uint32_t)(now - lastUpdateMs_B) < UPDATE_PERIOD) return;
-  lastUpdateMs_B = now;
-  if (currentPWM_B < targetPWM_B) {
-    int16_t next = currentPWM_B + (int16_t)MAX_PWM_STEP;
-    if (next > targetPWM_B) next = targetPWM_B;
-    currentPWM_B = next;
-  } else if (currentPWM_B > targetPWM_B) {
-    int16_t next = currentPWM_B - (int16_t)MAX_PWM_STEP;
-    if (next < targetPWM_B) next = targetPWM_B;
-    currentPWM_B = next;
+
+void handleServoClicks() {
+  // 十字キーUP/DOWNの「クリック」で1回ずつ動かす
+  if (PS4.getButtonClick(UP)) {
+    g_servoAngle += SERVO_STEP_DEG;
+    if (g_servoAngle > SERVO_MAX_DEG) g_servoAngle = SERVO_MAX_DEG;
+    g_servo.write(g_servoAngle);
+  }
+  if (PS4.getButtonClick(DOWN)) {
+    g_servoAngle -= SERVO_STEP_DEG;
+    if (g_servoAngle < SERVO_MIN_DEG) g_servoAngle = SERVO_MIN_DEG;
+    g_servo.write(g_servoAngle);
   }
 }
 
-// ---- フェイルセーフ（両モータ停止）----
-static inline void failSafe(bool connected) {
-  if (!connected) {
-    targetPWM_A = currentPWM_A = 0;
-    targetPWM_B = currentPWM_B = 0;
-    motorCoastA();
-    motorCoastB();
-    return;
+void handleServo2Clicks() {
+  // 右ボタン：+60°
+  if (PS4.getButtonClick(RIGHT)) {
+    g_servo2Angle += SERVO2_STEP_DEG;
+    if (g_servo2Angle > SERVO2_MAX_DEG) g_servo2Angle = SERVO2_MAX_DEG;
+    g_servo2.write(g_servo2Angle);
   }
-  if ((uint32_t)(millis() - lastRxMs) > FAILSAFE_MS) {
-    targetPWM_A = 0;
-    targetPWM_B = 0;
-    motorCoastA();
-    motorCoastB();
+  // 左ボタン：-60°
+  if (PS4.getButtonClick(LEFT)) {
+    g_servo2Angle -= SERVO2_STEP_DEG;
+    if (g_servo2Angle < SERVO2_MIN_DEG) g_servo2Angle = SERVO2_MIN_DEG;
+    g_servo2.write(g_servo2Angle);
   }
 }
 
+
+// ============== Setup/Loop ==================
 void setup() {
-  Serial.begin(115200);
-  while (!Serial) { ; }
+  // Serial.begin(115200);
 
   if (Usb.Init() == -1) {
-    Serial.println(F("USB Host Shield init failed."));
+    // Serial.println(F("USB Host Shield init failed"));
     while (1) { delay(1000); }
   }
-  Serial.println(F("USB Host OK. Keep your PS4 pairing flow."));
 
-  pinMode(PIN_PWM_A, OUTPUT);
-  pinMode(PIN_IN1_A, OUTPUT);
-  pinMode(PIN_IN2_A, OUTPUT);
+  motorA.begin();
+  motorB.begin();
 
-  pinMode(PIN_PWM_B, OUTPUT);
-  pinMode(PIN_IN3_B, OUTPUT);
-  pinMode(PIN_IN4_B, OUTPUT);
+  g_servo.attach(SERVO_PIN);
+  g_servo.write(g_servoAngle);
 
-  motorCoastA();
-  motorCoastB();
-
-  lastUpdateMs_A = lastUpdateMs_B = lastRxMs = millis();
+  g_servo2.attach(SERVO2_PIN);
+  g_servo2.write(g_servo2Angle);
 }
 
 void loop() {
-  Usb.Task();                         // 通信維持
-  const bool connected = PS4.connected();
-  failSafe(connected);
-  if (!connected) return;
+  Usb.Task();
+
+  // 未接続時はフェイルセーフ
+  if (!PS4.connected()) {
+    if (millis() - lastRxMs > FAILSAFE_MS) {
+      motorA.coast();
+      motorB.coast();
+    }
+    return;
+  }
+  lastRxMs = millis();
 
   // 非常停止（PS）
   if (PS4.getButtonClick(PS)) {
-    targetPWM_A = currentPWM_A = 0;
-    targetPWM_B = currentPWM_B = 0;
-    motorCoastA();
-    motorCoastB();
-    return;
+    emergencyStopAll();
+    return;  // このフレームはここで終了
   }
 
-  // ブレーキ（L1）: 両モータ
-  const bool braking = PS4.getButtonPress(L1);
-
-  // 左スティックY → Motor A
-  const uint8_t rawY_A = PS4.getAnalogHat(LeftHatY);
-  const int16_t cmdA   = stickToSignedPWM_neutralBand(rawY_A);
-  if (cmdA != targetPWM_A) { targetPWM_A = cmdA; lastRxMs = millis(); }
-
-  // 右スティックY → Motor B
-  const uint8_t rawY_B = PS4.getAnalogHat(RightHatY);
-  const int16_t cmdB   = stickToSignedPWM_neutralBand(rawY_B);
-  if (cmdB != targetPWM_B) { targetPWM_B = cmdB; lastRxMs = millis(); }
-
-  if (DEBUG_ECHO) {
-    Serial.print(F("LY=")); Serial.print(rawY_A);
-    Serial.print(F(" pwmA=")); Serial.print(targetPWM_A);
-    Serial.print(F(" | RY=")); Serial.print(rawY_B);
-    Serial.print(F(" pwmB=")); Serial.println(targetPWM_B);
-  }
-
-  // 出力
-  applyRampA();
-  applyRampB();
-  if (braking) {
-    motorBrakeA();
-    motorBrakeB();
+  // L1でブレーキ（押下中）
+  if (PS4.getButtonPress(L1)) {
+    motorA.brake();
+    motorB.brake();
   } else {
-    motorDriveSignedA(currentPWM_A);
-    motorDriveSignedB(currentPWM_B);
+    // スティックから目標PWM生成
+    uint8_t ly = PS4.getAnalogHat(LeftHatY);
+    uint8_t ry = PS4.getAnalogHat(RightHatY);
+
+    // PS4のY軸は 上=0 / 下=255 → 「上=前進」にしたいので符号反転
+    int targetA = -mapStickToPWM(ly);
+    int targetB = -mapStickToPWM(ry);
+
+    motorA.setTargetPWM(targetA);
+    motorB.setTargetPWM(targetB);
   }
 
-  delay(1);
+  // サーボ：UP/DOWNで±60°ずつ段階回転
+  handleServoClicks();
+  
+  // サーボ：right/leftで±60°ずつ段階回転
+  handleServo2Clicks();
+
+  // 一定周期でスロープ更新
+  uint32_t now = millis();
+  if (now - lastUpdateMs >= UPDATE_PERIOD) {
+    lastUpdateMs = now;
+    motorA.updateRamp(RAMP_STEP);
+    motorB.updateRamp(RAMP_STEP);
+  }
 }
