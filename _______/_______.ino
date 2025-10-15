@@ -1,52 +1,81 @@
-/*  _______-servo.ino  (UNO/USB Host Shield/PS4/L298N/Servo)
- *  修正点:
- *   - Motor 構造体に 3引数コンストラクタを追加（pwmPin, in1Pin, in2Pin）
- *   - 十字キーUP/DOWNをクリック毎に±60°の段階回転
- *   - 既存: スティック中立帯, スロープ, フェイルセーフ, L1ブレーキ, PS非常停止
+/*  _______.ino  (Arduino UNO + USB Host Shield 2.0 + PS4BT + L298N + 2xServo + NeoPixel)
+ *
+ *  機能:
+ *   - PS4コントローラ（BT）で2モータ制御（左右スティックY）。中立帯 & ランプ（スロープ）で滑らかに。
+ *   - 十字キー UP/DOWN：サーボ#1 を1クリックごとに ±60°（0..180°クランプ）
+ *   - 十字キー LEFT/RIGHT：サーボ#2 を1クリックごとに ±60°（0..180°クランプ）
+ *   - 〇ボタン：テープLED（WS2812B）をトグル（点灯/消灯）
+ *   - L1：押している間は電気ブレーキ
+ *   - PS：非常停止（Coast + 両サーボを初期角へ、LEDは状態維持）
+ *
+ *  配線:
+ *   - L298N モータA（左）： ENA(PWM)=D3, IN1=D4, IN2=D6
+ *   - L298N モータB（右）： ENB(PWM)=D5, IN3=D7, IN4=D8
+ *   - サーボ#1：D2
+ *   - サーボ#2：D9   （ServoライブラリはTimer1を使うがピンは任意可）
+ *   - NeoPixel：DIN=A0(D14)  ※USB HostのSPI(10-13)と衝突しないように
+ *
+ *  注意:
+ *   - NeoPixelは更新時にごく短時間割り込みが止まるため、連続更新は避ける（本コードはクリック時のみ更新）
+ *   - テープLEDは本数に応じて十分な5V電源を用意し、GNDをArduino/USB Hostと確実に共通化すること
  */
 
 #include <SPI.h>
 #include <usbhub.h>
 #include <PS4BT.h>
 #include <Servo.h>
+#include <Adafruit_NeoPixel.h>
 
-// ============== USB Host / PS4 ==============
+// ===================== USB Host / PS4 =====================
 USB     Usb;
 BTD     Btd(&Usb);
 PS4BT   PS4(&Btd);
 
-// ============== Servo =======================
-const uint8_t SERVO_PIN      = 2;
-const int     SERVO_MIN_DEG  = 0;
-const int     SERVO_MAX_DEG  = 180;
-const int     SERVO_STEP_DEG = 60;   // 1クリックで動かす角度
-const int     SERVO_INIT_DEG = 90;   // 非常停止時に戻す角度
+// ===================== NeoPixel (WS2812B) =================
+#define LED_PIN    A0       // DIN
+#define LED_COUNT  30       // テープのLED数に合わせて
+Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 
-Servo g_servo;
-int   g_servoAngle = SERVO_INIT_DEG;
+bool g_stripOn = false;     // 〇ボタンでトグル
+uint8_t LED_R = 255, LED_G = 64, LED_B = 0; // 点灯色（暖色）
+uint8_t LED_BRIGHTNESS = 64;
 
+void stripApply() {
+  if (g_stripOn) {
+    for (int i = 0; i < LED_COUNT; ++i) {
+      strip.setPixelColor(i, strip.Color(LED_R, LED_G, LED_B));
+    }
+  } else {
+    for (int i = 0; i < LED_COUNT; ++i) {
+      strip.setPixelColor(i, 0);
+    }
+  }
+  strip.show();
+}
 
-// ===== Servo #2 (LEFT/RIGHT クリックで±60°) =====
-const uint8_t SERVO2_PIN      = 0;   // ←未使用のピンに変更可
-const int     SERVO2_MIN_DEG  = 0;
-const int     SERVO2_MAX_DEG  = 180;
-const int     SERVO2_STEP_DEG = 60;  // 1クリックで動かす角度
-const int     SERVO2_INIT_DEG = 90;  // 非常停止時などの基準角
+// ===================== Servo ==============================
+const uint8_t SERVO1_PIN      = 2;    // UP/DOWN で動くサーボ
+const uint8_t SERVO2_PIN      = 0;    // LEFT/RIGHT で動くサーボ
+const int     SERVO_MIN_DEG   = 0;
+const int     SERVO_MAX_DEG   = 180;
+const int     SERVO_STEP_DEG  = 60;   // 1クリックで動かす角度
+const int     SERVO1_INIT_DEG = 90;   // 非常停止時に戻す角度
+const int     SERVO2_INIT_DEG = 90;
 
+Servo g_servo1;
 Servo g_servo2;
+int   g_servo1Angle = SERVO1_INIT_DEG;
 int   g_servo2Angle = SERVO2_INIT_DEG;
 
-
-// ============== Motor (L298N) ===============
+// ===================== Motors (L298N) =====================
 struct Motor {
-  uint8_t pwmPin;  // ENA/ENB (PWM)
+  uint8_t pwmPin;   // ENA/ENB (PWM)
   uint8_t in1Pin;
   uint8_t in2Pin;
 
-  int currentPWM;  // -255..+255
+  int currentPWM;   // -255..+255
   int targetPWM;
 
-  // ★ 追加: 明示的コンストラクタ（UNOでの初期化エラー対策）
   Motor() : pwmPin(255), in1Pin(255), in2Pin(255), currentPWM(0), targetPWM(0) {}
   Motor(uint8_t pwm, uint8_t in1, uint8_t in2)
   : pwmPin(pwm), in1Pin(in1), in2Pin(in2), currentPWM(0), targetPWM(0) {}
@@ -110,21 +139,21 @@ struct Motor {
   }
 };
 
-// ピン割り当て（L298N）: 左モータA / 右モータB
+// ピン割り当て: 左モータA / 右モータB
 Motor motorA(3, 4, 6);  // ENA=3(PWM), IN1=4, IN2=6
 Motor motorB(5, 7, 8);  // ENB=5(PWM), IN3=7, IN4=8
 
-// ============== Control params ==============
+// ===================== Control params =====================
 const uint8_t  NEUTRAL_LO     = 120; // スティック中立帯 下限
 const uint8_t  NEUTRAL_HI     = 135; // スティック中立帯 上限
-const uint8_t  RAMP_STEP      = 7;   // スロープ1ステップのPWM変化量
-const uint16_t UPDATE_PERIOD  = 12;  // スロープ更新周期[ms]
+const uint8_t  RAMP_STEP      = 7;   // ランプ1ステップのPWM変化量
+const uint16_t UPDATE_PERIOD  = 12;  // ランプ更新周期[ms]
 const uint16_t FAILSAFE_MS    = 600; // 入力喪失でCoastへ[ms]
 
 uint32_t lastUpdateMs = 0;
 uint32_t lastRxMs     = 0;
 
-// ============== Helpers =====================
+// ===================== Helpers ============================
 int mapStickToPWM(uint8_t v) {
   // 0..255, 中立はおおよそ 127
   if (v >= NEUTRAL_LO && v <= NEUTRAL_HI) return 0;
@@ -145,61 +174,64 @@ int mapStickToPWM(uint8_t v) {
 void emergencyStopAll() {
   motorA.coast();
   motorB.coast();
-  
-  g_servoAngle = SERVO_INIT_DEG;
-  g_servo.write(g_servoAngle);
-  
+
+  g_servo1Angle = SERVO1_INIT_DEG;
   g_servo2Angle = SERVO2_INIT_DEG;
+  g_servo1.write(g_servo1Angle);
   g_servo2.write(g_servo2Angle);
+  // LEDの状態は維持（必要ならここで g_stripOn=false; stripApply();）
 }
 
-void handleServoClicks() {
-  // 十字キーUP/DOWNの「クリック」で1回ずつ動かす
+void handleServo1Clicks() {
+  // 十字キー UP/DOWN → サーボ#1 を ±60°
   if (PS4.getButtonClick(UP)) {
-    g_servoAngle += SERVO_STEP_DEG;
-    if (g_servoAngle > SERVO_MAX_DEG) g_servoAngle = SERVO_MAX_DEG;
-    g_servo.write(g_servoAngle);
+    g_servo1Angle += SERVO_STEP_DEG;
+    if (g_servo1Angle > SERVO_MAX_DEG) g_servo1Angle = SERVO_MAX_DEG;
+    g_servo1.write(g_servo1Angle);
   }
   if (PS4.getButtonClick(DOWN)) {
-    g_servoAngle -= SERVO_STEP_DEG;
-    if (g_servoAngle < SERVO_MIN_DEG) g_servoAngle = SERVO_MIN_DEG;
-    g_servo.write(g_servoAngle);
+    g_servo1Angle -= SERVO_STEP_DEG;
+    if (g_servo1Angle < SERVO_MIN_DEG) g_servo1Angle = SERVO_MIN_DEG;
+    g_servo1.write(g_servo1Angle);
   }
 }
 
 void handleServo2Clicks() {
-  // 右ボタン：+60°
+  // 十字キー LEFT/RIGHT → サーボ#2 を ±60°
   if (PS4.getButtonClick(RIGHT)) {
-    g_servo2Angle += SERVO2_STEP_DEG;
-    if (g_servo2Angle > SERVO2_MAX_DEG) g_servo2Angle = SERVO2_MAX_DEG;
+    g_servo2Angle += SERVO_STEP_DEG;
+    if (g_servo2Angle > SERVO_MAX_DEG) g_servo2Angle = SERVO_MAX_DEG;
     g_servo2.write(g_servo2Angle);
   }
-  // 左ボタン：-60°
   if (PS4.getButtonClick(LEFT)) {
-    g_servo2Angle -= SERVO2_STEP_DEG;
-    if (g_servo2Angle < SERVO2_MIN_DEG) g_servo2Angle = SERVO2_MIN_DEG;
+    g_servo2Angle -= SERVO_STEP_DEG;
+    if (g_servo2Angle < SERVO_MIN_DEG) g_servo2Angle = SERVO_MIN_DEG;
     g_servo2.write(g_servo2Angle);
   }
 }
 
-
-// ============== Setup/Loop ==================
+// ===================== Setup / Loop =======================
 void setup() {
   // Serial.begin(115200);
 
   if (Usb.Init() == -1) {
-    // Serial.println(F("USB Host Shield init failed"));
+    // USB Host Shield 初期化失敗
     while (1) { delay(1000); }
   }
 
   motorA.begin();
   motorB.begin();
 
-  g_servo.attach(SERVO_PIN);
-  g_servo.write(g_servoAngle);
-
+  g_servo1.attach(SERVO1_PIN);
   g_servo2.attach(SERVO2_PIN);
+  g_servo1.write(g_servo1Angle);
   g_servo2.write(g_servo2Angle);
+
+  // NeoPixel 初期化
+  strip.begin();
+  strip.setBrightness(LED_BRIGHTNESS); // 0..255
+  g_stripOn = false;
+  stripApply();                        // 消灯反映
 }
 
 void loop() {
@@ -218,10 +250,10 @@ void loop() {
   // 非常停止（PS）
   if (PS4.getButtonClick(PS)) {
     emergencyStopAll();
-    return;  // このフレームはここで終了
+    return; // このフレームは終了
   }
 
-  // L1でブレーキ（押下中）
+  // L1押下中はブレーキ
   if (PS4.getButtonPress(L1)) {
     motorA.brake();
     motorB.brake();
@@ -238,11 +270,15 @@ void loop() {
     motorB.setTargetPWM(targetB);
   }
 
-  // サーボ：UP/DOWNで±60°ずつ段階回転
-  handleServoClicks();
-  
-  // サーボ：right/leftで±60°ずつ段階回転
-  handleServo2Clicks();
+  // サーボ：十字キーで段階回転
+  handleServo1Clicks(); // UP/DOWN → サーボ#1
+  handleServo2Clicks(); // LEFT/RIGHT → サーボ#2
+
+  // 〇ボタンでテープLED トグル
+  if (PS4.getButtonClick(CIRCLE)) {
+    g_stripOn = !g_stripOn;
+    stripApply();
+  }
 
   // 一定周期でスロープ更新
   uint32_t now = millis();
