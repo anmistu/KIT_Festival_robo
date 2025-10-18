@@ -1,18 +1,10 @@
 /*  _______.ino  (Arduino UNO + USB Host Shield 2.0 + PS4BT + L298N + 2xServo + NeoPixel)
  *
- *  変更点:
- *   - 〇ボタンのLEDモード切替を「OFF ↔ RAINBOW」の2モードみに簡略化
- *   - RAINBOWは非ブロッキングで20msごとにアニメ更新
- *
- *  既存機能:
- *   - 2モータ(ランプ/中立帯) + 2サーボ(UP/DOWN, LEFT/RIGHT 各±60°ステップ)
- *   - L1ブレーキ、PS非常停止（サーボ初期角に戻す／LED状態は維持）
- *
- *  配線:
- *   - L298N モータA: ENA=3(PWM), IN1=4, IN2=6
- *   - L298N モータB: ENB=5(PWM), IN3=7, IN4=8
- *   - サーボ1(DPad UP/DOWN)=D2, サーボ2(DPad LEFT/RIGHT)=D9
- *   - NeoPixel DIN=A0(D14)  ※USB HostのSPI(10–13)を避ける／GNDは必ず共通
+ *  変更点（今回）:
+ *   - L2/R2 でサーボをトグル:  L2=0°↔65° / R2=0°↔10°
+ *   - アナログ＋デジタルの両検出でR2無反応対策
+ *   - 非常停止＆起動時にトグル状態をfalseへリセット
+ *   - D-Pad操作は無効化（呼び出しを外しています）
  */
 
 #include <SPI.h>
@@ -28,7 +20,7 @@ PS4BT   PS4(&Btd);
 
 // ===================== NeoPixel (WS2812B) =================
 #define LED_PIN    A0        // DIN（A0=D14）
-#define LED_COUNT  108        // ★実機のLED本数に合わせて
+#define LED_COUNT  108
 Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 
 // LEDモード（2値のみ）
@@ -44,12 +36,20 @@ const uint16_t RAINBOW_INTERVAL_MS = 20;
 
 // ===================== Servo ==============================
 const uint8_t SERVO1_PIN      = 2;    // UP/DOWN
-const uint8_t SERVO2_PIN      = 0;    // LEFT/RIGHT
+const uint8_t SERVO2_PIN      = 0;    // LEFT/RIGHT（Serial使わない前提のD0）
 const int     SERVO_MIN_DEG   = 0;
-const int     SERVO_MAX_DEG   = 180;
-const int     SERVO_STEP_DEG  = 60;
-const int     SERVO1_INIT_DEG = 90;
-const int     SERVO2_INIT_DEG = 90;
+const int     SERVO_MAX_DEG   = 65;
+const int     SERVO_STEP_DEG  = 65;   // D-Pad用に残置（未使用）
+const int     SERVO1_INIT_DEG = 0;
+const int     SERVO2_INIT_DEG = 0;
+
+// === Added: distinct open angles for L2/R2 toggles ===
+const int SERVO1_OPEN_DEG = 65;  // L2 toggル開角
+const int SERVO2_OPEN_DEG = 10;  // R2 トグル開角（ご要望）
+bool g_servo1Open = false;
+bool g_servo2Open = false;
+bool g_l2Prev = false;
+bool g_r2Prev = false;
 
 Servo g_servo1, g_servo2;
 int   g_servo1Angle = SERVO1_INIT_DEG;
@@ -80,27 +80,32 @@ struct Motor {
   }
 };
 
-Motor motorA(3,4,6), motorB(5,7,8);
+Motor motorA(3,4,6);
+Motor motorB(5,7,8);
 
-// ===================== Control params =====================
-const uint8_t  NEUTRAL_LO     = 120;
-const uint8_t  NEUTRAL_HI     = 135;
-const uint8_t  RAMP_STEP      = 7;
-const uint16_t UPDATE_PERIOD  = 12;
-const uint16_t FAILSAFE_MS    = 600;
+const uint8_t RAMP_STEP     = 7;
+const uint16_t UPDATE_PERIOD= 12; // [ms]
 
-uint32_t lastUpdateMs = 0, lastRxMs = 0;
+uint32_t lastRxMs=0;
+uint32_t lastUpdateMs=0;
 
-// ===================== LED helpers ========================
+// スティック中立帯
+const int NEUTRAL_LO = 120;
+const int NEUTRAL_HI = 135;
+
+const uint16_t FAILSAFE_MS = 600;
+
+// ===================== 色ユーティリティ ====================
 uint32_t colorWheel(uint8_t pos){
+  pos = 255 - pos;
   if(pos < 85){
-    return strip.Color(pos*3, 255 - pos*3, 0);
-  } else if(pos < 170){
-    pos -= 85;
     return strip.Color(255 - pos*3, 0, pos*3);
-  } else {
-    pos -= 170;
+  }else if(pos < 170){
+    pos -= 85;
     return strip.Color(0, pos*3, 255 - pos*3);
+  }else{
+    pos -= 170;
+    return strip.Color(pos*3, 255 - pos*3, 0);
   }
 }
 
@@ -138,9 +143,11 @@ void emergencyStopAll(){
   motorA.coast(); motorB.coast();
   g_servo1Angle = SERVO1_INIT_DEG; g_servo2Angle = SERVO2_INIT_DEG;
   g_servo1.write(g_servo1Angle);   g_servo2.write(g_servo2Angle);
+  g_servo1Open = false; g_servo2Open = false;
   // LEDは状態維持（必要なら g_ledMode=LED_OFF; stripAllOff();）
 }
 
+// （D-Pad用：残置・未呼出）
 void handleServo1Clicks(){
   if(PS4.getButtonClick(UP)){
     g_servo1Angle += SERVO_STEP_DEG; if(g_servo1Angle>SERVO_MAX_DEG) g_servo1Angle=SERVO_MAX_DEG;
@@ -153,24 +160,45 @@ void handleServo1Clicks(){
 }
 void handleServo2Clicks(){
   if(PS4.getButtonClick(RIGHT)){
-    g_servo2Angle += SERVO_STEP_DEG; if(g_servo2Angle>SERVO_MAX_DEG) g_servo2Angle=SERVO_MAX_DEG;
+    g_servo2Angle += SERVO_STEP_DEG; if(g_servo2Angle == SERVO_MAX_DEG) g_servo2Angle=SERVO_MAX_DEG;
     g_servo2.write(g_servo2Angle);
   }
   if(PS4.getButtonClick(LEFT)){
-    g_servo2Angle -= SERVO_STEP_DEG; if(g_servo2Angle<SERVO_MIN_DEG) g_servo2Angle=SERVO_MIN_DEG;
+    g_servo2Angle -= SERVO_STEP_DEG; if(g_servo2Angle == SERVO_MIN_DEG) g_servo2Angle=SERVO_MIN_DEG;
     g_servo2.write(g_servo2Angle);
   }
 }
 
+// === Added: L2/R2 toggle control for servos (L2->Servo1 0/65°, R2->Servo2 0/10°) ===
+void updateServoToggle(){
+  // 一部のPS4BTはトリガーをアナログのみ報告するため、両検出を合成
+  const bool l2_now = (PS4.getAnalogButton(L2) > 20) || PS4.getButtonPress(L2);
+  const bool r2_now = (PS4.getAnalogButton(R2) > 20) || PS4.getButtonPress(R2);
+
+  if(l2_now && !g_l2Prev){
+    g_servo1Open = !g_servo1Open;
+    g_servo1Angle = g_servo1Open ? SERVO1_OPEN_DEG : SERVO_MIN_DEG;
+    g_servo1.write(g_servo1Angle);
+  }
+  if(r2_now && !g_r2Prev){
+    g_servo2Open = !g_servo2Open;
+    g_servo2Angle = g_servo2Open ? SERVO2_OPEN_DEG : SERVO_MIN_DEG;
+    g_servo2.write(g_servo2Angle);
+  }
+  g_l2Prev = l2_now;
+  g_r2Prev = r2_now;
+}
+
 // ===================== Setup / Loop =======================
 void setup(){
-  // Serial.begin(115200);
+  // Serial.begin(115200);  // SERVO2_PIN=D0使用のため未使用
   if(Usb.Init()==-1){ while(1){ delay(1000);} }
 
   motorA.begin(); motorB.begin();
 
   g_servo1.attach(SERVO1_PIN); g_servo2.attach(SERVO2_PIN);
   g_servo1.write(g_servo1Angle); g_servo2.write(g_servo2Angle);
+  g_servo1Open = false; g_servo2Open = false;
 
   strip.begin();
   strip.setBrightness(LED_BRIGHTNESS);
@@ -197,15 +225,14 @@ void loop(){
     motorB.setTargetPWM(-mapStickToPWM(ry));
   }
 
-  // サーボ（DPad）
-  handleServo1Clicks();
-  handleServo2Clicks();
+  // サーボ：L2/R2トグル（L2=65°, R2=10°）
+  // handleServo1Clicks();  // disabled: now using L2 toggle
+  updateServoToggle();     // added: L2/R2 servo toggles (R2=10°)
 
   // 〇ボタンで LEDモードを OFF ↔ RAINBOW にトグル
   if(PS4.getButtonClick(CIRCLE)){
     if(g_ledMode == LED_OFF){
       g_ledMode = LED_RAINBOW;
-      // 切り替え直後に即更新
       g_rainbowLast = 0;
       stripRainbowStep();
     }else{
