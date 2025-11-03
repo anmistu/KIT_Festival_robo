@@ -22,6 +22,18 @@
 #include <PS4BT.h>
 #include <Servo.h>
 #include <Adafruit_NeoPixel.h>
+#include <LiquidCrystal.h>
+
+
+// --- LCD pins (from LCD.ino, unchanged) ---
+#define RS_PIN 2
+#define E_PIN 4
+#define DB4_PIN 3
+#define DB5_PIN A3
+#define DB6_PIN A4
+#define DB7_PIN A5
+// Follow the same constructor order as LCD.ino to match your wiring
+LiquidCrystal lcd(RS_PIN, E_PIN, DB4_PIN, DB5_PIN, DB6_PIN, DB7_PIN);
 
 // ===================== USB Host / PS4 =====================
 USB     Usb;
@@ -62,7 +74,7 @@ uint32_t g_whiteLast2 = 0;
 const uint16_t SOLID_INTERVAL_MS = 50;  // 20〜100ms程度でOK
 
 // ===================== Servo ==============================
-const uint8_t SERVO1_PIN      = 2;
+const uint8_t SERVO1_PIN      = 1;
 const uint8_t SERVO2_PIN      = 0;    // Serial未使用前提でD0
 const int     SERVO_MIN_DEG   = 0;
 const int     SERVO1_OPEN_DEG = 50;   // L2トグル時
@@ -103,8 +115,8 @@ struct Motor {
   }
 };
 
-Motor motorA(3,4,6);
-Motor motorB(5,7,8);
+Motor motorA(9,5,6);
+Motor motorB(9,7,8);
 
 const uint8_t  RAMP_STEP      = 7;
 const uint16_t UPDATE_PERIOD  = 12; // [ms]
@@ -204,7 +216,11 @@ void updateServoToggle(){
 
 // ===================== Setup / Loop =======================
 void setup(){
-  // Serial.begin(115200);  // D0をServo2に使用するため未使用
+  
+// LCDの列と行を設定する
+ lcd.begin(16, 2);
+  
+// Serial.begin(115200);  // D0をServo2に使用するため未使用
   if(Usb.Init()==-1){ while(1){ delay(1000);} }
 
   motorA.begin(); motorB.begin();
@@ -225,6 +241,12 @@ void setup(){
 void loop(){
   Usb.Task();
 
+  //LCD処理
+  lcd.setCursor(0,0);
+  lcd.print(" SAFTY DRYVING!");
+  lcd.setCursor(0,1);
+  lcd.print("   THANK YOU!");
+  
   if(!PS4.connected()){
     if(millis()-lastRxMs>FAILSAFE_MS){ motorA.coast(); motorB.coast(); }
     // A1=赤 / A2=白 は常時維持
