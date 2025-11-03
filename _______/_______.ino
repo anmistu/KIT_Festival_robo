@@ -35,6 +35,62 @@
 // Follow the same constructor order as LCD.ino to match your wiring
 LiquidCrystal lcd(RS_PIN, E_PIN, DB4_PIN, DB5_PIN, DB6_PIN, DB7_PIN);
 
+// === 表示サイズ ===
+const uint8_t LCD_COLS = 16;
+const uint8_t LCD_ROWS = 2;
+
+// === テキストセット ===
+const char TXT_DEF_0[] = "SAFETY DRIVING!";
+const char TXT_DEF_1[] = "  THANK YOU!   ";
+const char TXT_HAL_0[] = "HAPPY HALLOWEEN!";
+const char TXT_HAL_1[] = "TRICK OR TREAT! ";
+
+// 行ごとのスクロール状態
+struct Marquee {
+  const char* text;        // 流したい文字列
+  uint8_t     row;         // 表示行(0 or 1)
+  uint16_t    idx;         // スクロール位置
+  unsigned long last;      // 前回更新時刻
+  unsigned long interval;  // 更新間隔(ms) ここを大きくすると“ゆっくり”
+};
+
+// 表示内容と速度（好みで調整OK）
+Marquee m0 = { TXT_DEF_0, 0, 0, 0, 500 };
+Marquee m1 = { TXT_DEF_0, 1, 0, 0, 500 };
+
+// 文字列と文字列の間の“空白のすき間”量
+const uint8_t GAP_SPACES = 6;
+
+// 現在のテーマ
+bool is_halloween = false;
+
+// === UIモード ===
+enum UIMode { MODE_WAITING, MODE_CONNECTED_FLASH, MODE_SCROLL };
+UIMode ui_mode = MODE_WAITING;
+
+// === 「PLEASE WAIT …」のドットアニメ設定 ===
+const char WAIT_BASE[] = "PLEASE WAIT";
+const uint8_t DOT_START_COL = 11;    // "PLEASE WAIT" の直後=列11(0始まり)
+const uint8_t DOT_SLOTS = 3;         // 「…」の3枠
+const unsigned long DOT_INTERVAL = 350; // ドット更新間隔(ms)
+unsigned long dot_last = 0;
+uint8_t dot_pos = 0;  // 0,1,2 の位置にピコピコ表示
+
+// === 接続演出（Connected! → フェード） ===
+#define BACKLIGHT_PWM_PIN  (-1)              // ← PWMでフェードするなら 5/6/10/11 などに変更
+const char CONNECTED_MSG[] = "Connected!";
+const unsigned long CONNECT_SHOW_MS = 3000;   // 表示の見せ時間（ms）
+const unsigned long FADE_TOTAL_MS   = 1500;   // フェード全体時間（ms）
+const unsigned long FADE_STEP_MS    = 500;   // （疑似フェード時）ステップ間隔
+
+unsigned long connected_phase_start = 0;
+unsigned long last_fade_step_ts = 0;
+uint8_t fade_step = 0;                       // 疑似フェード段階 0..N
+const uint8_t FADE_STEPS = 5;                // 疑似フェード段階数
+
+// === 接続フラグ（あなたのコードから true にする） ===
+volatile bool controller_connected = false;
+
 // ===================== USB Host / PS4 =====================
 USB     Usb;
 BTD     Btd(&Usb);
@@ -218,7 +274,9 @@ void updateServoToggle(){
 void setup(){
   
 // LCDの列と行を設定する
- lcd.begin(16, 2);
+  lcd.begin(LCD_COLS, LCD_ROWS);
+  applyMessageSet(false);
+  enterWaiting();
   
 // Serial.begin(115200);  // D0をServo2に使用するため未使用
   if(Usb.Init()==-1){ while(1){ delay(1000);} }
@@ -238,14 +296,226 @@ void setup(){
   g_whiteLast2 = 0; forceWhiteStrip2();
 }
 
+static void setMarqueeText(Marquee &m, const char* newText) {
+  m.text = newText;
+  m.idx = 0;        // 先頭からスクロール開始
+  m.last = 0;       // すぐに描画更新
+}
+
+static void applyDefaultMessages() {
+  setMarqueeText(m0, TXT_DEF_0);
+  setMarqueeText(m1, TXT_DEF_1);
+}
+
+static void applyMessageSet(bool halloween) {
+  if (halloween) {
+    setMarqueeText(m0, TXT_HAL_0);
+    setMarqueeText(m1, TXT_HAL_1);
+  } else {
+    setMarqueeText(m0, TXT_DEF_0);
+    setMarqueeText(m1, TXT_DEF_1);
+  }
+}
+
+static void toggleHalloween() {
+  is_halloween = !is_halloween;
+  applyMessageSet(is_halloween);
+}
+
+static void updateMarquee(Marquee &m) {
+  unsigned long now = millis();
+  if (now - m.last < m.interval) return;  // 非ブロッキング更新
+  m.last = now;
+
+  const char* s = m.text;
+  uint16_t len = 0;
+  while (s[len] != '\0') len++;
+
+  // 先頭に画面幅ぶんの空白 + 本文 + 余白GAP をリング状に流す
+  uint16_t padLen = LCD_COLS + len + GAP_SPACES;
+
+  char window[LCD_COLS + 1];
+  for (uint8_t j = 0; j < LCD_COLS; ++j) {
+    uint16_t pos = (m.idx + j) % padLen;
+    char ch;
+    if (pos < LCD_COLS) {
+      ch = ' '; // 画面外(右)からにゅっと出てくるための空白
+    } else if (pos < LCD_COLS + len) {
+      ch = s[pos - LCD_COLS];
+    } else {
+      ch = ' '; // 文末～次周回までの余白
+    }
+    window[j] = ch;
+  }
+  window[LCD_COLS] = '\0';
+
+  lcd.setCursor(0, m.row);
+  lcd.print(window);
+
+  m.idx = (m.idx + 1) % padLen;
+}
+
+// ---------- WAITモード描画 ----------
+static void enterWaiting() {
+  ui_mode = MODE_WAITING;
+  lcd.clear();
+  lcd.noCursor();      // カーソル非表示
+  // 行0に固定文字列
+  lcd.setCursor(0, 0);
+  lcd.print(WAIT_BASE);
+  // ドット領域を初期化
+  lcd.setCursor(DOT_START_COL, 0);
+  lcd.print("   ");    // 3つ分の空白
+  // 下の行は空白に（好みでメッセージ可）
+  lcd.setCursor(0, 1);
+  lcd.print("                ");
+  dot_pos = 0;
+  dot_last = 0;
+}
+
+static void updateWaitingDots() {
+  unsigned long now = millis();
+  if (now - dot_last < DOT_INTERVAL) return;
+  dot_last = now;
+
+  // 3枠を一旦消す
+  lcd.setCursor(DOT_START_COL, 0);
+  lcd.print("   ");
+  // 現在位置にドットを1つだけ出す
+  lcd.setCursor(DOT_START_COL + dot_pos, 0);
+  lcd.print(".");
+  // 次の位置へ
+  dot_pos = (dot_pos + 1) % DOT_SLOTS;
+}
+
+// ---------------- CONNECTED! → フェード ----------------
+static void drawCentered(const char* msg, uint8_t row) {
+  uint8_t len = 0; while (msg[len] != '\0') len++;
+  uint8_t col = (LCD_COLS > len) ? (LCD_COLS - len) / 2 : 0;
+  lcd.setCursor(0, row); lcd.print("                ");
+  lcd.setCursor(col, row); lcd.print(msg);
+}
+
+// 疑似フェード（文字を徐々に消す）: 両端から縮める
+static void drawConnectedPseudoFade(uint8_t stage) {
+  // stage=0 → "Connected!" 全表示, stageが進むごとに両端から消える
+  uint8_t full = 0; while (CONNECTED_MSG[full] != '\0') full++;
+  int show_len = (int)full - 2 * (int)stage;
+  if (show_len <= 0) {
+    drawCentered("", 0);
+    return;
+  }
+  uint8_t start = stage;
+  // 一時バッファ
+  char buf[17];
+  for (int i = 0; i < show_len && i < 16; ++i) buf[i] = CONNECTED_MSG[start + i];
+  buf[(show_len < 16 ? show_len : 16)] = '\0';
+  drawCentered(buf, 0);
+}
+
+static void enterConnectedFlash() {
+  ui_mode = MODE_CONNECTED_FLASH;
+  lcd.clear();
+  drawCentered(CONNECTED_MSG, 0);
+  // 2行目はクリア
+  lcd.setCursor(0, 1);
+  lcd.print("                ");
+
+#if BACKLIGHT_PWM_PIN >= 0
+  pinMode(BACKLIGHT_PWM_PIN, OUTPUT);
+  analogWrite(BACKLIGHT_PWM_PIN, 255); // フェード開始は明るく
+#endif
+
+  connected_phase_start = millis();
+  last_fade_step_ts = connected_phase_start;
+  fade_step = 0;
+}
+
+static void updateConnectedFlash() {
+  unsigned long now = millis();
+  unsigned long elapsed = now - connected_phase_start;
+
+#if BACKLIGHT_PWM_PIN >= 0
+  // 実フェード（バックライトPWM）
+  if (elapsed < CONNECT_SHOW_MS) {
+    // まだ見せ時間中 → 何もしない
+  } else if (elapsed < CONNECT_SHOW_MS + FADE_TOTAL_MS) {
+    float t = (float)(elapsed - CONNECT_SHOW_MS) / (float)FADE_TOTAL_MS; // 0..1
+    int level = (int)(255.0f * (1.0f - t)); // 255→0
+    if (level < 0) level = 0;
+    analogWrite(BACKLIGHT_PWM_PIN, level);
+  } else {
+    // フェード完了 → 明るさ戻して次へ
+    analogWrite(BACKLIGHT_PWM_PIN, 255);
+    // スクロールへ
+    // 1行目=SAFETY DRIVING, 2行目=THANK YOU
+    lcd.clear();
+    applyDefaultMessages();
+    ui_mode = MODE_SCROLL;
+  }
+#else
+  // 疑似フェード（文字を徐々に消す）
+  if (elapsed < CONNECT_SHOW_MS) {
+    // 見せ時間中はそのまま
+  } else {
+    if (now - last_fade_step_ts >= FADE_STEP_MS) {
+      last_fade_step_ts = now;
+      if (fade_step <= FADE_STEPS) {
+        drawConnectedPseudoFade(fade_step);
+        fade_step++;
+      } else {
+        // フェード完了 → スクロールへ
+        lcd.clear();
+        applyDefaultMessages();
+        ui_mode = MODE_SCROLL;
+      }
+    }
+  }
+#endif
+}
+
+// ---------- SCROLLモードへ切替 ----------
+static void enterScroll() {
+  ui_mode = MODE_SCROLL;
+  lcd.clear();
+  applyDefaultMessages();  // 1行目=SAFETY DRIVING, 2行目=THANK YOU
+#if BACKLIGHT_PWM_PIN >= 0
+  analogWrite(BACKLIGHT_PWM_PIN, 255);  // 念のため明るさ復帰
+#endif
+}
+
+// ---------- 外部イベント：接続完了で呼ぶ ----------
+void onControllerConnected() {
+  controller_connected = true;
+  enterConnectedFlash();
+}
+
 void loop(){
   Usb.Task();
 
-  //LCD処理
-  lcd.setCursor(0,0);
-  lcd.print(" SAFTY DRYVING!");
-  lcd.setCursor(0,1);
-  lcd.print("   THANK YOU!");
+  static bool wasConnected = false;
+  bool nowConnected = PS4.connected();
+
+  if (nowConnected && !wasConnected) {
+    wasConnected = true;
+    onControllerConnected();   // ← ここでWAIT→SCROLLへ切替
+  } else if (!nowConnected && wasConnected) {
+    wasConnected = false;
+    enterWaiting();            // ← 切断検出でWAITに戻す（任意）
+  }  
+
+  if (ui_mode == MODE_WAITING) {
+    updateWaitingDots();              // 「…」だけピコピコ
+    if (controller_connected) {
+      enterScroll();                  // 接続できたらスクロール表示へ
+    }
+    }
+    else if(ui_mode == MODE_CONNECTED_FLASH){
+      updateConnectedFlash();
+    } else {
+    updateMarquee(m0);
+    updateMarquee(m1);
+    }
   
   if(!PS4.connected()){
     if(millis()-lastRxMs>FAILSAFE_MS){ motorA.coast(); motorB.coast(); }
@@ -272,6 +542,7 @@ void loop(){
 
   // ○ボタンで strip0: OFF ↔ RAINBOW
   if(PS4.getButtonClick(CIRCLE)){
+    toggleHalloween();
     if(g_ledMode0 == LED_OFF){ g_ledMode0 = LED_RAINBOW; g_rainbowLast0 = 0; }
     else{ g_ledMode0 = LED_OFF; setStrip0Off(); }
   }
